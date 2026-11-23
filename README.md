@@ -58,7 +58,7 @@ unset for local development.
 
 Streams also carry a `level` label; empty labels are left out. API keys are redacted from everything pushed, including
 tracebacks and extra fields. A push that fails is not retried (the journal still has the record) and is reported on
-stderr. Settings: the `loki_*` fields of `Settings` in `src/nsls2api/infrastructure/config.py`; handler:
+stderr on one line, with the push secret masked. Settings: the `loki_*` fields of `Settings` in `src/nsls2api/infrastructure/config.py`; handler:
 `src/nsls2api/infrastructure/loki.py`.
 
 ### Code Style

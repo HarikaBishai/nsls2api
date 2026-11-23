@@ -16,14 +16,20 @@ import socket
 import sys
 import threading
 import traceback
+from collections.abc import Callable
 from typing import Any
+from urllib.parse import unquote
 
 from loki_logger_handler.formatters.logger_formatter import LoggerFormatter
 from loki_logger_handler.loki_logger_handler import LokiLoggerHandler
 from pydantic import ValidationError
 
 from nsls2api.infrastructure.config import get_settings
-from nsls2api.infrastructure.logging import RedactApiKeyFilter, redact_api_keys
+from nsls2api.infrastructure.logging import (
+    REDACTED,
+    RedactApiKeyFilter,
+    redact_api_keys,
+)
 
 # (connect, read) seconds for each Loki push.
 _LOKI_TIMEOUT = (5.0, 10.0)
@@ -32,6 +38,28 @@ _LOKI_TIMEOUT = (5.0, 10.0)
 # line: asctime, left by the console formatters that run first, and the ANSI-coloured
 # copy of the message that uvicorn adds to some records.
 _CONSOLE_ONLY_FIELDS = ("asctime", "color_message")
+
+
+def _masking(secret: str) -> Callable[[logging.LogRecord], bool]:
+    """Return a log filter that replaces the push secret in a record's message.
+
+    The library's error messages can carry the secret: requests puts a header value
+    it rejects into its exception, as its repr. Mask the secret as given, stripped,
+    and escaped, longest first.
+    """
+    forms = sorted(
+        {secret, secret.strip(), repr(secret)[1:-1]} - {""}, key=len, reverse=True
+    )
+
+    def mask(record: logging.LogRecord) -> bool:
+        text = record.getMessage()
+        for form in forms:
+            text = text.replace(form, REDACTED)
+        record.msg = text
+        record.args = None
+        return True
+
+    return mask
 
 
 def _without_traceback(record: logging.LogRecord) -> bool:
@@ -67,9 +95,11 @@ class SerializedLokiHandler(LokiLoggerHandler):
 def _redacted_json_value(value: Any) -> Any:
     """Return ``value`` as JSON-serializable data, with API keys redacted from all text.
 
-    Goes into dicts, lists and tuples. Anything else that is not a JSON scalar becomes
-    its ``str()``, because the library serializes a whole batch at once and one value
-    it cannot serialize loses every record in that batch.
+    Goes into dicts, lists and tuples. A value under a field whose decoded name contains
+    "api_key" is replaced whole, as in a query string, so an encoded key is caught too.
+    Anything else that is not a JSON scalar becomes its ``str()``, because the library
+    serializes a whole batch at once and one value it cannot serialize loses every
+    record in that batch.
     """
     if isinstance(value, str):
         return redact_api_keys(value)
@@ -77,7 +107,11 @@ def _redacted_json_value(value: Any) -> Any:
         return value
     if isinstance(value, dict):
         return {
-            redact_api_keys(str(key)): _redacted_json_value(item)
+            redact_api_keys(str(key)): (
+                REDACTED
+                if "api_key" in unquote(str(key)).lower()
+                else _redacted_json_value(item)
+            )
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple, set, frozenset)):
@@ -143,6 +177,8 @@ def loki_handler() -> logging.Handler:
     # Report failed pushes on stderr (the journal), redacted and on one line each,
     # without sending them back to Loki.
     console = logging.StreamHandler(sys.stderr)
+    # Before the line is flattened, which could change a secret with whitespace in it.
+    console.addFilter(_masking(secret))
     console.addFilter(_without_traceback)
     console.addFilter(RedactApiKeyFilter())
     handler.debug_logger.propagate = False

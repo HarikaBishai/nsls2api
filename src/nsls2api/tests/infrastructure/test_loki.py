@@ -192,6 +192,22 @@ def test_extra_fields_are_redacted(configured):
     assert "color_message" not in line
 
 
+def test_values_under_api_key_field_names_are_redacted(configured):
+    # An encoded key is not shaped like one, so only the field name gives it away.
+    encoded = "%6E" + FAKE_KEY[1:]
+    handler, recorder = configured
+    logging.getLogger("uvicorn.error.nsls2api").info(
+        "lookup",
+        extra={"api_key": encoded, "params": {"API%5FKEY": encoded, "page": 2}},
+    )
+    handler._send()
+
+    assert encoded.encode() not in gzip.decompress(recorder.requests[0].body)
+    (line,) = recorder.lines()
+    assert line["api_key"] == REDACTED
+    assert line["params"] == {"API%5FKEY": REDACTED, "page": 2}
+
+
 def test_nested_extra_fields_are_redacted(configured):
     handler, recorder = configured
     logging.getLogger("uvicorn.error.nsls2api").info(
@@ -284,3 +300,25 @@ def test_failed_pushes_are_reported_on_stderr_not_in_loki(configured):
     assert err.count("\n") == 1
     # The failure report is not queued for the next push.
     assert handler.buffer.empty()
+
+
+def test_failure_reports_mask_the_push_secret(loki_env):
+    # requests rejects a header value with a newline, and quotes it in its error.
+    loki_env.setenv("LOKI_PUSH_SECRET", "s3cret\n")
+    handler = loki_handler()
+    (report,) = [
+        h for h in handler.debug_logger.handlers if type(h) is logging.StreamHandler
+    ]
+    report.setStream(io.StringIO())
+    logger = logging.getLogger("test_loki.secret")
+    logger.addHandler(handler)
+    try:
+        logger.warning("hello")
+        handler._send()
+    finally:
+        logger.removeHandler(handler)
+
+    err = report.stream.getvalue()
+    assert "header value" in err
+    assert "s3cret" not in err
+    assert REDACTED in err
