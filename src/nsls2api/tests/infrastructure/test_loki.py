@@ -5,14 +5,21 @@ import logging
 import logging.config
 import threading
 from pathlib import Path
+from urllib.parse import quote
 
+import httpx
 import pytest
 import requests
 import yaml
+from pydantic import BaseModel, SecretStr
 from requests.adapters import BaseAdapter
 
 from nsls2api.infrastructure.logging import REDACTED
-from nsls2api.infrastructure.loki import SerializedLokiHandler, loki_handler
+from nsls2api.infrastructure.loki import (
+    SerializedLokiHandler,
+    _secret_forms,
+    loki_handler,
+)
 
 URL = "https://loki.test/loki/api/v1/push"
 LOG_CONFIG = Path(__file__).parents[4] / "uvicorn_log_config.yml"
@@ -20,6 +27,10 @@ LOGGERS = ("uvicorn.error", "uvicorn.access")
 
 # Not a real key: the shape is all the redaction looks at.
 FAKE_KEY = "nsls2-api-" + "0123456789abcdef" * 4
+# Not real credentials either. The PASS key has characters a URL encodes.
+PASS_KEY = "Pa55/Key+Value=0123"
+MONGODB_PASSWORD = "m0ngo@pass"
+MONGODB_DSN = "mongodb://nsls2api:m0ngo%40pass@db1.test:27017,db2.test:27017/pytest"
 
 
 class Recorder(BaseAdapter):
@@ -80,6 +91,9 @@ def loki_env(monkeypatch):
     monkeypatch.setenv("LOKI_JOB", "nsls2api")
     monkeypatch.setenv("LOKI_ENVIRONMENT", "test")
     monkeypatch.setenv("LOKI_HOST", "api-test.nsls2.bnl.gov")
+    # Credentials that are not shaped like an API key (see test_credentials_...).
+    monkeypatch.setenv("PASS_API_KEY", PASS_KEY)
+    monkeypatch.setenv("MONGODB_DSN", MONGODB_DSN)
     return monkeypatch
 
 
@@ -304,7 +318,7 @@ def test_failed_pushes_are_reported_on_stderr_not_in_loki(configured):
 
 def test_failure_reports_mask_the_push_secret(loki_env):
     # requests rejects a header value with a newline, and quotes it in its error.
-    loki_env.setenv("LOKI_PUSH_SECRET", "s3cret\n")
+    loki_env.setenv("LOKI_PUSH_SECRET", "push-s3cret\n")
     handler = loki_handler()
     (report,) = [
         h for h in handler.debug_logger.handlers if type(h) is logging.StreamHandler
@@ -320,5 +334,43 @@ def test_failure_reports_mask_the_push_secret(loki_env):
 
     err = report.stream.getvalue()
     assert "header value" in err
-    assert "s3cret" not in err
+    assert "push-s3cret" not in err
     assert REDACTED in err
+
+
+def test_credentials_in_settings_are_masked_before_delivery(configured):
+    handler, recorder = configured
+    log = logging.getLogger("uvicorn.error.nsls2api")
+    # The connection log line init_connection() writes, with the password in the DSN.
+    log.info(f"Attempting to connect to {MONGODB_DSN}")
+    # A PASS call that fails: httpx puts the URL, with the key in its path, in the
+    # error, and logger.exception() adds the traceback.
+    url = f"https://pass.test/Proposal/GetProposal/{quote(PASS_KEY, safe='')}/1/2"
+    request = httpx.Request("GET", url)
+    try:
+        httpx.Response(404, request=request).raise_for_status()
+    except httpx.HTTPStatusError:
+        log.exception(f"Error retrieving proposal 2 from PASS ({PASS_KEY}).")
+    handler._send()
+
+    body = b"".join(gzip.decompress(r.body) for r in recorder.requests).decode()
+    for credential in (
+        PASS_KEY,
+        quote(PASS_KEY, safe=""),
+        MONGODB_PASSWORD,
+        "m0ngo%40pass",
+    ):
+        assert credential not in body
+    lines = {line["message"].split()[0]: line for line in recorder.lines()}
+    assert "nsls2api:REDACTED@db1.test" in lines["Attempting"]["message"]
+    assert f"GetProposal/{REDACTED}/1/2" in lines["Error"]["stacktrace"]
+
+
+def test_every_secret_str_setting_is_masked_whatever_its_name():
+    class Configured(BaseModel):
+        ups_credential: SecretStr = SecretStr("ups-c0nfidential")
+        ups_url: str = "https://ups.test"
+
+    forms = _secret_forms(Configured())
+    assert "ups-c0nfidential" in forms
+    assert "https://ups.test" not in forms

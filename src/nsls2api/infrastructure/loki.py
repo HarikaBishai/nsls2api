@@ -5,26 +5,27 @@ uvicorn loggers, next to the console handlers. Logs are pushed only when ``LOKI_
 and ``LOKI_PUSH_SECRET`` are set (the ``loki_*`` fields of ``Settings`` in ``config.py``);
 otherwise the handler does nothing.
 
-API keys must not reach the shared Loki tenant, so the handler formats records with
-:class:`RedactingLokiFormatter` and the log configuration gives it the same
-``RedactApiKeyFilter`` as the console handlers.
+API keys and other credentials must not reach the shared Loki tenant, so the handler
+formats records with :class:`RedactingLokiFormatter` and the log configuration gives
+it the same ``RedactApiKeyFilter`` as the console handlers.
 """
 
 import functools
 import logging
+import re
 import socket
 import sys
 import threading
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import quote, quote_plus, unquote
 
 from loki_logger_handler.formatters.logger_formatter import LoggerFormatter
 from loki_logger_handler.loki_logger_handler import LokiLoggerHandler
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
-from nsls2api.infrastructure.config import get_settings
+from nsls2api.infrastructure.config import Settings, get_settings
 from nsls2api.infrastructure.logging import (
     REDACTED,
     RedactApiKeyFilter,
@@ -39,27 +40,75 @@ _LOKI_TIMEOUT = (5.0, 10.0)
 # copy of the message that uvicorn adds to some records.
 _CONSOLE_ONLY_FIELDS = ("asctime", "color_message")
 
+# Settings whose values are credentials, by field name.
+_SECRET_FIELD_NAME = re.compile(r"key|secret|token|password", re.IGNORECASE)
+# Shorter values are not masked: replacing them would mangle ordinary text.
+_MIN_SECRET_LENGTH = 8
 
-def _masking(secret: str) -> Callable[[logging.LogRecord], bool]:
-    """Return a log filter that replaces the push secret in a record's message.
 
-    The library's error messages can carry the secret: requests puts a header value
-    it rejects into its exception, as its repr. Mask the secret as given, stripped,
-    and escaped, longest first.
+def _secret_forms(settings: Settings) -> list[str]:
+    """The configured credentials, in every form they can take in a log line.
+
+    Covers every ``SecretStr`` setting (the Loki push secret), settings named like
+    credentials (the PASS key, Slack tokens, the LDAP bind password) and the password
+    in the MongoDB DSN. Each is included as given, stripped, URL-decoded and encoded
+    (a PASS key sits in a URL path) and escaped as in a repr (requests quotes a header
+    value it rejects). Longest first, so a longer form is replaced before a shorter
+    one inside it.
     """
-    forms = sorted(
-        {secret, secret.strip(), repr(secret)[1:-1]} - {""}, key=len, reverse=True
+    secrets: set[str] = set()
+    for name in type(settings).model_fields:
+        value = getattr(settings, name)
+        if isinstance(value, SecretStr):
+            secrets.add(value.get_secret_value())
+        elif callable(getattr(value, "hosts", None)):
+            secrets.update(
+                host["password"] for host in value.hosts() if host["password"]
+            )
+        elif isinstance(value, str) and _SECRET_FIELD_NAME.search(name):
+            secrets.add(value)
+
+    forms: set[str] = set()
+    for secret in secrets:
+        for raw in {secret, unquote(secret)}:
+            forms.update(
+                {
+                    raw,
+                    raw.strip(),
+                    repr(raw)[1:-1],
+                    quote(raw),
+                    quote(raw, safe=""),
+                    quote_plus(raw),
+                }
+            )
+    return sorted(
+        (form for form in forms if len(form) >= _MIN_SECRET_LENGTH),
+        key=len,
+        reverse=True,
     )
 
-    def mask(record: logging.LogRecord) -> bool:
-        text = record.getMessage()
+
+def _masker(forms: Iterable[str]) -> Callable[[str], str]:
+    forms = list(forms)
+
+    def mask(text: str) -> str:
         for form in forms:
             text = text.replace(form, REDACTED)
-        record.msg = text
+        return text
+
+    return mask
+
+
+def _masking(forms: Iterable[str]) -> Callable[[logging.LogRecord], bool]:
+    """Return a log filter that masks the configured credentials in a record's message."""
+    mask = _masker(forms)
+
+    def masking(record: logging.LogRecord) -> bool:
+        record.msg = mask(record.getMessage())
         record.args = None
         return True
 
-    return mask
+    return masking
 
 
 def _without_traceback(record: logging.LogRecord) -> bool:
@@ -92,8 +141,8 @@ class SerializedLokiHandler(LokiLoggerHandler):
             super()._send()
 
 
-def _redacted_json_value(value: Any) -> Any:
-    """Return ``value`` as JSON-serializable data, with API keys redacted from all text.
+def _redacted_json_value(value: Any, redact: Callable[[str], str]) -> Any:
+    """Return ``value`` as JSON-serializable data, with ``redact`` applied to all text.
 
     Goes into dicts, lists and tuples. A value under a field whose decoded name contains
     "api_key" is replaced whole, as in a query string, so an encoded key is caught too.
@@ -102,33 +151,39 @@ def _redacted_json_value(value: Any) -> Any:
     record in that batch.
     """
     if isinstance(value, str):
-        return redact_api_keys(value)
+        return redact(value)
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, dict):
         return {
-            redact_api_keys(str(key)): (
+            redact(str(key)): (
                 REDACTED
                 if "api_key" in unquote(str(key)).lower()
-                else _redacted_json_value(item)
+                else _redacted_json_value(item, redact)
             )
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [_redacted_json_value(item) for item in value]
-    return redact_api_keys(str(value))
+        return [_redacted_json_value(item, redact) for item in value]
+    return redact(str(value))
 
 
 class RedactingLokiFormatter(LoggerFormatter):
-    """The library's formatter, with API keys redacted and tracebacks at every level.
+    """The library's formatter, with credentials redacted and tracebacks at every level.
 
     The library builds the traceback from ``exc_info``, which ``RedactApiKeyFilter``
     does not change, and copies extra record attributes as they are. Here the
     traceback is the redacted ``exc_text`` the filter left on the record, and every
-    field is made JSON-serializable and redacted again, nested values included, before
-    the record leaves the process. The library adds a traceback only to records whose
-    level starts with "ER"; here any record with an exception gets one.
+    field is made JSON-serializable, with API keys and the configured credentials
+    (``secret_forms``) redacted, nested values included, before the record leaves the
+    process. The library adds a traceback only to records whose level starts with
+    "ER"; here any record with an exception gets one.
     """
+
+    def __init__(self, secret_forms: Iterable[str] = ()) -> None:
+        super().__init__()
+        mask = _masker(secret_forms)
+        self._redact = lambda text: redact_api_keys(mask(text))
 
     def format(
         self, record: logging.LogRecord
@@ -140,7 +195,7 @@ class RedactingLokiFormatter(LoggerFormatter):
             formatted["stacktrace"] = record.exc_text or "".join(
                 traceback.format_exception(*record.exc_info)
             )
-        return _redacted_json_value(formatted), loki_metadata
+        return _redacted_json_value(formatted, self._redact), loki_metadata
 
 
 def loki_handler() -> logging.Handler:
@@ -166,19 +221,20 @@ def loki_handler() -> logging.Handler:
         "environment": settings.loki_environment,
         "host": settings.loki_host or socket.gethostname(),
     }
+    secret_forms = _secret_forms(settings)
     handler = SerializedLokiHandler(
         url=settings.loki_url,
         labels={k: v for k, v in labels.items() if v},
         label_keys=["level"],
         additional_headers={"loki-push-secret": secret},
-        default_formatter=RedactingLokiFormatter(),
+        default_formatter=RedactingLokiFormatter(secret_forms),
         enable_self_errors=True,
     )
     # Report failed pushes on stderr (the journal), redacted and on one line each,
     # without sending them back to Loki.
     console = logging.StreamHandler(sys.stderr)
     # Before the line is flattened, which could change a secret with whitespace in it.
-    console.addFilter(_masking(secret))
+    console.addFilter(_masking(secret_forms))
     console.addFilter(_without_traceback)
     console.addFilter(RedactApiKeyFilter())
     handler.debug_logger.propagate = False
