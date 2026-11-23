@@ -45,7 +45,7 @@ directory as the json files).
 
 When started with `uvicorn_log_config.yml` (as the container is), application (`uvicorn.error`) logs can also be pushed to
 [Grafana Loki](https://grafana.com/oss/loki/) with [`loki-logger-handler`](https://pypi.org/project/loki-logger-handler/).
-Access logs remain local and are not pushed to Loki.
+Access logs are not currently pushed to Loki.
 This is off unless both `LOKI_URL` and `LOKI_PUSH_SECRET` are set (in the environment or the `.env` file); leave them
 unset for local development.
 
