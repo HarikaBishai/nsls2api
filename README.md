@@ -41,6 +41,26 @@ directory as the json files).
 3. Ensure that you have the `bnlroot.crt` file (which is deployed to all BNL managed machines) in the location specified
    within the `.env` file.
 
+### Logging to Loki
+
+When started with `uvicorn_log_config.yml` (as the container is), the application and access logs can also be pushed to
+[Grafana Loki](https://grafana.com/oss/loki/) with [`loki-logger-handler`](https://pypi.org/project/loki-logger-handler/).
+This is off unless both `LOKI_URL` and `LOKI_PUSH_SECRET` are set (in the environment or the `.env` file); leave them
+unset for local development.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `LOKI_URL` | (empty) | Loki push URL |
+| `LOKI_PUSH_SECRET` | (empty) | Value of the `loki-push-secret` header |
+| `LOKI_JOB` | `nsls2api` | `job` and `service_name` labels |
+| `LOKI_ENVIRONMENT` | (empty) | `environment` label, e.g. `production` or `development` |
+| `LOKI_HOST` | the hostname | `host` label |
+
+Streams also carry a `level` label; empty labels are left out. API keys are redacted from everything pushed, including
+tracebacks and extra fields. A push that fails is not retried (the journal still has the record) and is reported on
+stderr. Settings: the `loki_*` fields of `Settings` in `src/nsls2api/infrastructure/config.py`; handler:
+`src/nsls2api/infrastructure/loki.py`.
+
 ### Code Style
 
 This project uses `ruff` to format the code - in order to run the formatter simply type:
