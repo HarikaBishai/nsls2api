@@ -49,5 +49,4 @@ loggers:
     level: INFO
     handlers:
       - access
-      - loki
     propagate: no

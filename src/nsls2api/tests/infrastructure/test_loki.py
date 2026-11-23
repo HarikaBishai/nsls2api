@@ -132,13 +132,13 @@ def test_does_nothing_when_the_app_settings_are_invalid(loki_env):
     assert type(loki_handler()) is logging.NullHandler
 
 
-def test_both_uvicorn_loggers_share_one_loki_handler(configured):
+def test_only_uvicorn_error_logger_uses_loki_handler(configured):
     handler, _ = configured
-    for name in LOGGERS:
-        assert handler in logging.getLogger(name).handlers
+    assert handler in logging.getLogger("uvicorn.error").handlers
+    assert handler not in logging.getLogger("uvicorn.access").handlers
 
 
-def test_access_log_is_pushed_with_labels_and_secret_but_no_api_key(configured):
+def test_access_log_is_not_pushed_to_loki(configured):
     handler, recorder = configured
     logging.getLogger("uvicorn.access").info(
         '%s - "%s %s HTTP/%s" %d',
@@ -150,26 +150,7 @@ def test_access_log_is_pushed_with_labels_and_secret_but_no_api_key(configured):
     )
     handler._send()
 
-    request = recorder.requests[0]
-    assert request.url == URL
-    assert request.headers["loki-push-secret"] == "s3cret"
-    assert request.headers["Content-Encoding"] == "gzip"
-    assert FAKE_KEY.encode() not in gzip.decompress(request.body)
-
-    (stream,) = recorder.streams()
-    assert stream["stream"] == {
-        "job": "nsls2api",
-        "service_name": "nsls2api",
-        "environment": "test",
-        "host": "api-test.nsls2.bnl.gov",
-        "level": "INFO",
-    }
-    (line,) = recorder.lines()
-    assert f"/v1/proposals/?api_key={REDACTED}" in line["message"]
-    assert line["name"] == "uvicorn.access"
-    assert "correlation_id" in line
-    # Set by the console formatter, which runs first; not wanted in Loki.
-    assert "asctime" not in line
+    assert recorder.requests == []
 
 
 @pytest.mark.parametrize("level", [logging.WARNING, logging.ERROR, logging.CRITICAL])
